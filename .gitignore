@@ -1,0 +1,24 @@
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Secrets
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Local databases and uploaded files
+*.db
+*.sqlite
+*.sqlite3
+data/uploads/
+uploads/
+
+# Logs and OS files
+*.log
+.DS_Store
+Thumbs.db
