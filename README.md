@@ -11,7 +11,7 @@
 | Name | USN | Mobile |
 | :--- | :--- | :--- |
 | **Shamitha H S** | `1SI24CS161` | 7975348582 |
-| **Skarzang Lamo** | `1SI24CS172` | 7006820598 |
+| **Skarma Lamo** | `1SI24CS172` | 7006820598 |
 | **Snehalatha** | `1SI24CS174` | 8073815036 |
 | **Sharanya H M** | `1SI24CS213` | 8310968958 |
 
