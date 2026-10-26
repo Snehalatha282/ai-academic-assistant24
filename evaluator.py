@@ -4,12 +4,14 @@ import json
 from typing import Dict, Any, List, Optional
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+from config import MARK_SCHEMES, calibrate_scheme_components
 
 class StudentAnswerEvaluator:
     """
     Intelligent Scheme-Based Student Answer Evaluation Engine.
     Evaluates student answers against academic marking rubrics, calculates marks,
     highlights missing concepts, and provides constructive examiner feedback.
+    Strictly divides and calibrates rubric marks with respect to target marks.
     """
 
     def __init__(self, api_key: Optional[str] = None, model_name: str = "gemini-2.5-flash"):
@@ -17,18 +19,41 @@ class StudentAnswerEvaluator:
         self.model_name = model_name
 
     def evaluate_answer(self, question: str, target_marks: float, student_answer: str,
-                        scheme: Dict[str, Any], model_answer: str = "") -> Dict[str, Any]:
+                        scheme: Optional[Dict[str, Any]], model_answer: str = "") -> Dict[str, Any]:
         """
         Evaluates student answer against scheme and model answer.
+        Guarantees that component allocated marks strictly divide with respect to target_marks.
         """
+        target_marks = float(target_marks)
         student_answer = student_answer.strip()
+
+        # Resolve and calibrate scheme components
+        raw_components = None
+        if scheme:
+            raw_components = scheme.get("components") or scheme.get("breakdown")
+        if not raw_components:
+            base_scheme = MARK_SCHEMES.get(int(target_marks), MARK_SCHEMES[10])
+            raw_components = base_scheme.get("components") or base_scheme.get("breakdown")
+
+        calibrated_components = calibrate_scheme_components(raw_components, target_marks)
+
         if not student_answer:
+            comp_evals = [
+                {
+                    "criterion": c.get("component", "Concept"),
+                    "allocated_marks": float(c.get("marks", 1.0)),
+                    "marks_awarded": 0.0,
+                    "status": "Missing",
+                    "comments": "No response provided for this rubric component."
+                }
+                for c in calibrated_components
+            ]
             return {
                 "marks_awarded": 0.0,
                 "target_marks": target_marks,
                 "percentage": 0.0,
                 "grade": "F (Incomplete / Blank)",
-                "component_evaluations": [],
+                "component_evaluations": comp_evals,
                 "missing_points": ["No answer provided by the student."],
                 "strengths": [],
                 "examiner_feedback": "Please write your answer to receive an evaluation."
@@ -37,22 +62,22 @@ class StudentAnswerEvaluator:
         # Attempt Gemini evaluation if key provided
         if self.api_key:
             try:
-                res = self._evaluate_with_gemini(question, target_marks, student_answer, scheme, model_answer)
+                res = self._evaluate_with_gemini(question, target_marks, student_answer, calibrated_components, model_answer)
                 if res:
                     return res
             except Exception as e:
                 print(f"Gemini evaluation failed, falling back to NLP rubric engine: {e}")
 
         # Intelligent NLP Rubric Engine
-        return self._evaluate_with_nlp(question, target_marks, student_answer, scheme, model_answer)
+        return self._evaluate_with_nlp(question, target_marks, student_answer, calibrated_components, model_answer)
 
     def _evaluate_with_gemini(self, question: str, target_marks: float, student_answer: str,
-                              scheme: Dict[str, Any], model_answer: str) -> Optional[Dict[str, Any]]:
+                              calibrated_components: List[Dict[str, Any]], model_answer: str) -> Optional[Dict[str, Any]]:
         import google.generativeai as genai
         genai.configure(api_key=self.api_key)
         model = genai.GenerativeModel(self.model_name)
 
-        rubric_str = json.dumps(scheme.get("components", []), indent=2)
+        rubric_str = json.dumps(calibrated_components, indent=2)
 
         prompt = f"""
 You are an experienced University Professor and Chief Examiner in Computer Science at Siddaganga Institute of Technology (SIT) / VTU.
@@ -61,7 +86,7 @@ Evaluate the following student's written examination answer against the official
 QUESTION: {question}
 TARGET MARKS: {target_marks}
 
-OFFICIAL MARKING SCHEME:
+OFFICIAL MARKING SCHEME (Each component must be scored out of its allocated marks):
 {rubric_str}
 
 REFERENCE MODEL ANSWER:
@@ -75,7 +100,8 @@ STUDENT'S SUBMITTED ANSWER:
 \"\"\"
 
 Carefully assess each component of the scheme. Award realistic academic marks with justification.
-Identify specific missing concepts, formulas, diagram references, or explanations.
+The sum of allocated_marks across all component_evaluations must equal exactly {target_marks}.
+The sum of marks_awarded must equal the overall marks_awarded.
 
 Return ONLY a JSON object with this exact structure:
 {{
@@ -110,31 +136,62 @@ Return ONLY a JSON object with this exact structure:
 
         try:
             data = json.loads(response.text)
+            raw_evals = data.get("component_evaluations", [])
+            calibrated_evals = []
+
+            for i, target_c in enumerate(calibrated_components):
+                target_alloc = float(target_c.get("marks", 1.0))
+                if i < len(raw_evals):
+                    ev_item = raw_evals[i]
+                    crit_name = ev_item.get("criterion", target_c.get("component", f"Component {i+1}"))
+                    awarded_raw = float(ev_item.get("marks_awarded", 0.0))
+                    gemini_alloc = float(ev_item.get("allocated_marks", target_alloc))
+                    if gemini_alloc > 0:
+                        awarded_norm = round((awarded_raw / gemini_alloc) * target_alloc, 1)
+                    else:
+                        awarded_norm = min(target_alloc, awarded_raw)
+                    awarded_norm = min(target_alloc, max(0.0, awarded_norm))
+                    status = ev_item.get("status", "Partial Credit")
+                    comments = ev_item.get("comments", f"Awarded {awarded_norm}/{target_alloc} marks.")
+                else:
+                    crit_name = target_c.get("component", f"Component {i+1}")
+                    awarded_norm = round(target_alloc * 0.5, 1)
+                    status = "Partial Credit"
+                    comments = f"Awarded {awarded_norm}/{target_alloc} marks."
+
+                calibrated_evals.append({
+                    "criterion": crit_name,
+                    "allocated_marks": target_alloc,
+                    "marks_awarded": awarded_norm,
+                    "status": status,
+                    "comments": comments
+                })
+
+            total_awarded = round(sum(c["marks_awarded"] for c in calibrated_evals), 1)
+            total_awarded = min(target_marks, total_awarded)
+
+            data["component_evaluations"] = calibrated_evals
+            data["target_marks"] = target_marks
+            data["marks_awarded"] = total_awarded
+            data["percentage"] = round((total_awarded / target_marks) * 100, 1)
             return data
         except Exception as e:
             print(f"Error parsing Gemini evaluation: {e}")
             return None
 
     def _evaluate_with_nlp(self, question: str, target_marks: float, student_answer: str,
-                           scheme: Dict[str, Any], model_answer: str) -> Dict[str, Any]:
+                           calibrated_components: List[Dict[str, Any]], model_answer: str) -> Dict[str, Any]:
         """
         Rule-based and NLP semantic similarity evaluator.
+        Calibrates marks strictly to target_marks.
         """
-        components = scheme.get("components", [
-            {"component": "Core Definition & Concepts", "marks": target_marks * 0.4},
-            {"component": "Technical Details & Explanation", "marks": target_marks * 0.4},
-            {"component": "Examples / Diagram / Formula", "marks": target_marks * 0.2}
-        ])
-
         student_lower = student_answer.lower()
         word_count = len(student_answer.split())
 
         component_evals = []
-        total_awarded = 0.0
         missing_pts = []
         strengths = []
 
-        # Reference tokens from model answer
         ref_text = model_answer if model_answer else question
 
         # Calculate semantic cosine similarity
@@ -145,7 +202,7 @@ Return ONLY a JSON object with this exact structure:
         except Exception:
             similarity = 0.5
 
-        for comp in components:
+        for comp in calibrated_components:
             name = comp.get("component", "Concept")
             max_m = float(comp.get("marks", 1.0))
             name_lower = name.lower()
@@ -162,7 +219,6 @@ Return ONLY a JSON object with this exact structure:
                     missing_pts.append(f"Incomplete definition or conceptual foundation for {name}.")
 
             elif "diagram" in name_lower or "architecture" in name_lower or "schematic" in name_lower:
-                # Check if student referenced diagram keywords
                 diagram_keywords = ["diagram", "figure", "box", "layer", "module", "flow", "arrow", "shown below", "graph"]
                 if any(kw in student_lower for kw in diagram_keywords):
                     score_factor = 0.8
@@ -180,12 +236,13 @@ Return ONLY a JSON object with this exact structure:
                     score_factor = 0.3
                     missing_pts.append(f"Did not include mathematical notation or algorithmic steps required for {name}.")
 
-            else: # General explanation / points
-                length_adequacy = min(1.0, word_count / (target_marks * 25))
+            else:
+                length_adequacy = min(1.0, word_count / max(1.0, target_marks * 25))
                 score_factor = (0.5 * similarity) + (0.5 * length_adequacy)
 
-            awarded = round(max_m * score_factor, 2)
-            total_awarded += awarded
+            # Round awarded marks cleanly to 1 decimal place
+            awarded = round(max_m * score_factor, 1)
+            awarded = min(max_m, max(0.0, awarded))
 
             status = "Full Marks" if awarded >= max_m * 0.85 else ("Partial Credit" if awarded > 0 else "Missing")
             component_evals.append({
@@ -196,8 +253,17 @@ Return ONLY a JSON object with this exact structure:
                 "comments": f"Awarded {awarded}/{max_m} marks based on semantic coverage."
             })
 
-        # Cap total awarded
-        total_awarded = min(target_marks, round(total_awarded, 1))
+        total_awarded = round(sum(item["marks_awarded"] for item in component_evals), 1)
+        total_awarded = min(target_marks, total_awarded)
+
+        # Ensure sum of marks_awarded equals total_awarded
+        diff = round(total_awarded - sum(item["marks_awarded"] for item in component_evals), 1)
+        if diff != 0 and component_evals:
+            max_item = max(component_evals, key=lambda c: c["allocated_marks"])
+            new_val = round(max_item["marks_awarded"] + diff, 1)
+            max_item["marks_awarded"] = max(0.0, min(max_item["allocated_marks"], new_val))
+            total_awarded = round(sum(item["marks_awarded"] for item in component_evals), 1)
+
         percentage = round((total_awarded / target_marks) * 100, 1)
 
         # Grade determination

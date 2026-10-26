@@ -4,11 +4,12 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 class PDFChunk:
-    def __init__(self, text: str, page: int, chunk_id: int, source_doc: str, section: Optional[str] = None):
+    def __init__(self, text: str, page: int, chunk_id: int, source_doc: str, doc_id: Optional[str] = None, section: Optional[str] = None):
         self.text = text
         self.page = page
         self.chunk_id = chunk_id
         self.source_doc = source_doc
+        self.doc_id = doc_id or "default_doc"
         self.section = section or f"Page {page}"
 
     def to_dict(self) -> Dict[str, Any]:
@@ -17,6 +18,7 @@ class PDFChunk:
             "page": self.page,
             "chunk_id": self.chunk_id,
             "source_doc": self.source_doc,
+            "doc_id": self.doc_id,
             "section": self.section
         }
 
@@ -124,11 +126,15 @@ class AcademicPDFProcessor:
                     break
         return headings
 
-    def create_chunks(self, pages_data: List[Dict[str, Any]], source_doc: str) -> List[PDFChunk]:
+    def create_chunks(self, pages_data: List[Dict[str, Any]], source_doc: str, doc_id: Optional[str] = None) -> List[PDFChunk]:
         """
         Segments page texts into academic chunks with overlap,
         preserving page numbers and section context.
         """
+        if not doc_id:
+            import hashlib
+            doc_id = hashlib.sha256(source_doc.encode("utf-8")).hexdigest()[:12]
+
         all_chunks = []
         chunk_counter = 1
 
@@ -155,7 +161,8 @@ class AcademicPDFProcessor:
                             text=current_buffer,
                             page=page_num,
                             chunk_id=chunk_counter,
-                            source_doc=source_doc
+                            source_doc=source_doc,
+                            doc_id=doc_id
                         )
                         all_chunks.append(chunk)
                         chunk_counter += 1
@@ -173,7 +180,8 @@ class AcademicPDFProcessor:
                                         text=sub_buffer,
                                         page=page_num,
                                         chunk_id=chunk_counter,
-                                        source_doc=source_doc
+                                        source_doc=source_doc,
+                                        doc_id=doc_id
                                     )
                                     all_chunks.append(chunk)
                                     chunk_counter += 1
@@ -187,22 +195,34 @@ class AcademicPDFProcessor:
                     text=current_buffer,
                     page=page_num,
                     chunk_id=chunk_counter,
-                    source_doc=source_doc
+                    source_doc=source_doc,
+                    doc_id=doc_id
                 )
                 all_chunks.append(chunk)
                 chunk_counter += 1
 
         return all_chunks
 
-    def process_file(self, file_path: str, source_doc: Optional[str] = None) -> Dict[str, Any]:
+    def process_file(self, file_path: str, source_doc: Optional[str] = None, doc_id: Optional[str] = None) -> Dict[str, Any]:
         """Complete ingestion pipeline for a single file."""
         if not source_doc:
             source_doc = Path(file_path).name
 
+        if not doc_id:
+            import hashlib
+            file_sig = f"{source_doc}"
+            try:
+                p = Path(file_path)
+                file_sig = f"{source_doc}_{p.stat().st_size}_{p.stat().st_mtime}"
+            except Exception:
+                pass
+            doc_id = hashlib.sha256(file_sig.encode("utf-8")).hexdigest()[:12]
+
         pages = self.extract_text_from_pdf(file_path)
-        chunks = self.create_chunks(pages, source_doc)
+        chunks = self.create_chunks(pages, source_doc, doc_id)
 
         return {
+            "doc_id": doc_id,
             "source_doc": source_doc,
             "file_path": str(file_path),
             "total_pages": len(pages),

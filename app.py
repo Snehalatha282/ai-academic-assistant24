@@ -1,8 +1,29 @@
 import os
 import json
+import inspect
+import importlib
 import streamlit as st
 import streamlit.components.v1 as components
 from pathlib import Path
+
+# Reload local modules dynamically to prevent stale module caching across hot-reloads
+import config
+import database
+import pdf_processor
+import rag_engine
+import generator
+import evaluator
+import diagram_engine
+import blueprint_engine
+
+importlib.reload(config)
+importlib.reload(database)
+importlib.reload(pdf_processor)
+importlib.reload(rag_engine)
+importlib.reload(generator)
+importlib.reload(evaluator)
+importlib.reload(diagram_engine)
+importlib.reload(blueprint_engine)
 
 from config import PROJECT_INFO, MARK_SCHEMES, UPLOADS_DIR, GEMINI_MODELS
 from database import (
@@ -23,7 +44,7 @@ init_db()
 # Streamlit Page Configuration
 st.set_page_config(
     page_title="AI Academic Assistant | SIT Tumakuru",
-    page_icon="🎓",
+    
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -140,8 +161,19 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Initialize Session State
-if "rag_engine" not in st.session_state:
+def _is_valid_rag_engine(engine):
+    if not engine or not hasattr(engine, "search") or not hasattr(engine, "clear"):
+        return False
+    try:
+        sig = inspect.signature(engine.search)
+        return "active_doc_ids" in sig.parameters
+    except Exception:
+        return False
+
+if "rag_engine" not in st.session_state or not _is_valid_rag_engine(st.session_state.rag_engine):
     st.session_state.rag_engine = AcademicRAGEngine()
+    if st.session_state.get("all_chunks"):
+        st.session_state.rag_engine.build_index(st.session_state.all_chunks)
 if "all_chunks" not in st.session_state:
     st.session_state.all_chunks = []
 if "doc_metadata" not in st.session_state:
@@ -186,11 +218,6 @@ def load_sample_demo_mode():
         )
         st.session_state.blueprint_fingerprint = compute_doc_fingerprint(st.session_state.doc_metadata)
 
-# On initial first load, load sample demo if nothing exists
-if not st.session_state.all_chunks and "initial_loaded" not in st.session_state:
-    st.session_state.initial_loaded = True
-    load_sample_demo_mode()
-
 # Header Banner
 st.markdown(f"""
 <div class="main-header">
@@ -199,9 +226,7 @@ st.markdown(f"""
     <div style="font-size: 18px; font-weight: 600; color: #ffffff; margin-bottom: 6px;">
         📖 {PROJECT_INFO['title']}
     </div>
-    <div class="team-badge-container">
-        {"".join([f'<div class="team-badge">👤 {m["name"]} ({m["usn"]})</div>' for m in PROJECT_INFO['team']])}
-    </div>
+    
 </div>
 """, unsafe_allow_html=True)
 
@@ -259,6 +284,11 @@ with st.sidebar:
                 st.session_state.current_answer = None
                 st.session_state.current_evaluation = None
                 st.session_state.user_question_input = ""
+                st.session_state.active_doc_ids = []
+                if hasattr(st.session_state.rag_engine, "clear"):
+                    st.session_state.rag_engine.clear()
+                else:
+                    st.session_state.rag_engine = AcademicRAGEngine()
             
             with st.spinner("Processing documents, extracting academic text, and chunking..."):
                 for f in uploaded_files:
@@ -305,6 +335,32 @@ with st.sidebar:
     col_sb2.metric("Total Pages", total_pages)
     st.metric("RAG Chunks", total_chunks)
 
+    # Active Document Selection (Strict Isolation)
+    if st.session_state.doc_metadata:
+        st.subheader("🎯 Active Document Scope")
+        doc_names = [d.get("source_doc", "Document") for d in st.session_state.doc_metadata]
+        
+        if len(doc_names) == 1:
+            st.info(f"Active Document: **{doc_names[0]}**")
+            st.session_state.active_doc_ids = [st.session_state.doc_metadata[0].get("doc_id")]
+        else:
+            scope_options = ["All Selected Documents"] + doc_names
+            selected_scope = st.selectbox(
+                "Filter retrieval to document:",
+                options=scope_options,
+                index=0,
+                help="Select an individual uploaded document or choose all uploaded documents."
+            )
+            if selected_scope == "All Selected Documents":
+                st.session_state.active_doc_ids = [d.get("doc_id") for d in st.session_state.doc_metadata]
+            else:
+                st.session_state.active_doc_ids = [
+                    d.get("doc_id") for d in st.session_state.doc_metadata 
+                    if d.get("source_doc") == selected_scope
+                ]
+    else:
+        st.session_state.active_doc_ids = []
+
     # Document management buttons
     st.subheader("🛠️ Document Actions")
     if st.button("🧪 Load Sample OS Notes (Demo Mode)", use_container_width=True):
@@ -320,7 +376,11 @@ with st.sidebar:
         st.session_state.current_answer = None
         st.session_state.current_evaluation = None
         st.session_state.user_question_input = ""
-        st.session_state.rag_engine.build_index([])
+        st.session_state.active_doc_ids = []
+        if hasattr(st.session_state.rag_engine, "clear"):
+            st.session_state.rag_engine.clear()
+        else:
+            st.session_state.rag_engine = AcademicRAGEngine()
         st.rerun()
 
 # Tabs Interface
@@ -388,11 +448,26 @@ with tab1:
         if not user_question.strip():
             st.warning("Please enter an academic question.")
         elif not st.session_state.all_chunks:
-            st.warning("Please upload a course document in the sidebar or load the sample demo notes.")
+            st.warning("Please upload a course document in the sidebar.")
         else:
             with st.spinner(f"Retrieving semantic chunks and synthesizing {target_marks}-Mark answer..."):
                 top_k = 3 if target_marks == 2 else (5 if target_marks == 5 else 7)
-                retrieved_chunks = st.session_state.rag_engine.search(user_question, top_k=top_k)
+                active_ids = st.session_state.get("active_doc_ids")
+                try:
+                    retrieved_chunks = st.session_state.rag_engine.search(
+                        user_question, 
+                        top_k=top_k,
+                        active_doc_ids=active_ids
+                    )
+                except TypeError:
+                    st.session_state.rag_engine = AcademicRAGEngine()
+                    if st.session_state.all_chunks:
+                        st.session_state.rag_engine.build_index(st.session_state.all_chunks)
+                    retrieved_chunks = st.session_state.rag_engine.search(
+                        user_question, 
+                        top_k=top_k,
+                        active_doc_ids=active_ids
+                    )
                 
                 generator = AcademicAnswerGenerator(
                     api_key=user_api_key or os.getenv("GEMINI_API_KEY"),
@@ -424,36 +499,43 @@ with tab1:
         ans_data = st.session_state.current_answer
         st.divider()
 
-        # Rubric Card
-        st.markdown(f"### 📋 Official University Evaluation Scheme ({ans_data['marks']} Marks)")
-        scheme_obj = ans_data.get("scheme", {})
-        components_list = scheme_obj.get("components", [])
-        
-        # Display Rubric Table
-        rubric_cols = st.columns([3, 1])
-        with rubric_cols[0]:
-            for comp in components_list:
-                st.markdown(f"- **{comp.get('component')}**: `{comp.get('marks')} Marks`")
-        with rubric_cols[1]:
-            st.metric("Total Mark Weightage", f"{scheme_obj.get('total_allocated', ans_data['marks'])} M")
+        if ans_data.get("answer_markdown") == "The uploaded PDF does not contain enough relevant information to answer this question.":
+            st.warning("⚠️ **The uploaded PDF does not contain enough relevant information to answer this question.**")
+            st.info("The semantic retrieval engine found no content directly addressing this question in the currently selected document. Please verify your question or select the relevant document in the sidebar.")
+        else:
+            # Rubric Card
+            st.markdown(f"### 📋 Official University Evaluation Scheme ({ans_data['marks']} Marks)")
+            scheme_obj = ans_data.get("scheme", {})
+            components_list = scheme_obj.get("components", [])
+            
+            # Display Rubric Table
+            rubric_cols = st.columns([3, 1])
+            with rubric_cols[0]:
+                for comp in components_list:
+                    st.markdown(f"- **{comp.get('component')}**: `{comp.get('marks')} Marks`")
+            with rubric_cols[1]:
+                st.metric("Total Mark Weightage", f"{scheme_obj.get('total_allocated', ans_data['marks'])} M")
 
-        st.divider()
-
-        # Model Answer Card
-        st.markdown(f"### ✍️ Model Answer ({ans_data['marks']} Marks Standard)")
-        st.markdown(ans_data["answer_markdown"])
-
-        # Labeled Diagram Card
-        if ans_data.get("diagram_needed") and ans_data.get("diagram_code"):
             st.divider()
-            diag_title = ans_data.get("diagram_title", "Neat Labeled Architecture / Workflow Diagram")
-            st.markdown(f"### 📊 {diag_title}")
-            
-            diagram_html = DiagramEngine.generate_html_embed(ans_data["diagram_code"], diag_title)
-            components.html(diagram_html, height=360, scrolling=True)
-            
-            with st.expander("🔍 View Raw Mermaid Diagram Code"):
-                st.code(ans_data["diagram_code"], language="mermaid")
+
+            # Model Answer Card
+            st.markdown(f"### ✍️ Model Answer ({ans_data['marks']} Marks Standard)")
+            st.markdown(ans_data["answer_markdown"])
+
+            # Labeled Diagram Card
+            if ans_data.get("diagram_needed") and ans_data.get("diagram_code"):
+                st.divider()
+                diag_title = ans_data.get("diagram_title", "Neat Labeled Architecture / Workflow Diagram")
+                st.markdown(f"### 📊 {diag_title}")
+                
+                diagram_html = DiagramEngine.generate_html_embed(ans_data["diagram_code"], diag_title)
+                components.html(diagram_html, height=360, scrolling=True)
+                
+                with st.expander("🔍 View Raw Mermaid Diagram Code"):
+                    st.code(ans_data["diagram_code"], language="mermaid")
+            elif ans_data.get("diagram_message"):
+                st.divider()
+                st.caption(f"ℹ️ **Diagram Note**: {ans_data['diagram_message']}")
 
         # Full Mark Tips
         if ans_data.get("tips_for_full_marks"):
@@ -538,18 +620,29 @@ with tab2:
         placeholder="Write or paste the student's answer here..."
     )
 
-    if st.button("📊 Evaluate Answer Against Marking Scheme", type="primary", use_container_width=True):
+    if st.button("📊 " \
+    "nswer Against Marking Scheme", type="primary", use_container_width=True):
         if not student_text.strip():
             st.warning("Please provide a student answer to evaluate.")
         else:
             with st.spinner("Evaluating student response against academic scheme rubrics..."):
-                # Retrieve matching scheme
-                if st.session_state.current_answer and st.session_state.current_answer.get("question") == eval_q:
+                # Retrieve matching scheme calibrated strictly to eval_marks
+                if (st.session_state.current_answer 
+                    and st.session_state.current_answer.get("question") == eval_q 
+                    and st.session_state.current_answer.get("marks") == eval_marks):
                     active_scheme = st.session_state.current_answer["scheme"]
                     model_ans = st.session_state.current_answer["answer_markdown"]
                 else:
-                    active_scheme = MARK_SCHEMES.get(eval_marks, MARK_SCHEMES[10])
-                    model_ans = ""
+                    active_template = MARK_SCHEMES.get(eval_marks, MARK_SCHEMES[10])
+                    active_scheme = {
+                        "target_marks": eval_marks,
+                        "components": [
+                            {"component": b["component"], "marks": b["marks"]}
+                            for b in (active_template.get("components") or active_template.get("breakdown", []))
+                        ],
+                        "total_allocated": eval_marks
+                    }
+                    model_ans = st.session_state.current_answer.get("answer_markdown", "") if st.session_state.current_answer else ""
 
                 evaluator = StudentAnswerEvaluator(
                     api_key=user_api_key or os.getenv("GEMINI_API_KEY"),
@@ -592,7 +685,7 @@ with tab2:
         """, unsafe_allow_html=True)
 
         # Rubric Component Breakdown
-        st.markdown("### 📊 Scheme Rubric Breakdown")
+        st.markdown(f"### 📊 Scheme Rubric Breakdown ({ev.get('target_marks', eval_marks)} Marks)")
         comp_evals = ev.get("component_evaluations", [])
         if comp_evals:
             for item in comp_evals:
@@ -602,6 +695,10 @@ with tab2:
                 col_c2.markdown(f"`{item.get('marks_awarded')} / {item.get('allocated_marks')} M`")
                 col_c3.markdown(f"<span style='color: {status_color}; font-weight: 600;'>{item.get('status')}</span>", unsafe_allow_html=True)
                 st.divider()
+
+            sum_alloc = round(sum(c.get("allocated_marks", 0) for c in comp_evals), 1)
+            sum_awarded = round(sum(c.get("marks_awarded", 0) for c in comp_evals), 1)
+            st.caption(f"📌 **Weightage Total**: `{sum_awarded} / {sum_alloc} Marks` (Calibrated 100% to the {ev.get('target_marks', eval_marks)}-mark base)")
 
         col_fb1, col_fb2 = st.columns(2)
         with col_fb1:
@@ -628,8 +725,16 @@ with tab3:
     if not st.session_state.doc_metadata or not st.session_state.all_chunks:
         st.info("ℹ️ No academic documents are currently processed. Please upload course documents in the sidebar (or click 'Load Sample OS Notes (Demo Mode)') to dynamically generate an exam blueprint.")
     else:
-        current_fp = compute_doc_fingerprint(st.session_state.doc_metadata)
-        source_names = [d.get("source_doc", "Document") for d in st.session_state.doc_metadata]
+        active_ids = st.session_state.get("active_doc_ids")
+        if active_ids:
+            active_metadata = [d for d in st.session_state.doc_metadata if d.get("doc_id") in active_ids or d.get("source_doc") in active_ids]
+            active_chunks = [c for c in st.session_state.all_chunks if c.get("doc_id") in active_ids or c.get("source_doc") in active_ids]
+        else:
+            active_metadata = st.session_state.doc_metadata
+            active_chunks = st.session_state.all_chunks
+
+        current_fp = compute_doc_fingerprint(active_metadata)
+        source_names = [d.get("source_doc", "Document") for d in active_metadata]
 
         # Top Bar: Status and Refresh Button
         col_hdr1, col_hdr2 = st.columns([3, 1])
@@ -655,8 +760,8 @@ with tab3:
                     model_name=selected_model
                 )
                 blueprint = bp_engine.generate_blueprint(
-                    st.session_state.doc_metadata,
-                    st.session_state.all_chunks
+                    active_metadata,
+                    active_chunks
                 )
                 st.session_state.blueprint_data = blueprint
                 st.session_state.blueprint_fingerprint = current_fp
@@ -785,7 +890,21 @@ with tab4:
         st.markdown("### 🔎 Semantic Chunk Search Tester")
         search_query = st.text_input("Enter search query to test RAG similarity:")
         if search_query:
-            results = st.session_state.rag_engine.search(search_query, top_k=4)
+            try:
+                results = st.session_state.rag_engine.search(
+                    search_query, 
+                    top_k=4, 
+                    active_doc_ids=st.session_state.get("active_doc_ids")
+                )
+            except TypeError:
+                st.session_state.rag_engine = AcademicRAGEngine()
+                if st.session_state.all_chunks:
+                    st.session_state.rag_engine.build_index(st.session_state.all_chunks)
+                results = st.session_state.rag_engine.search(
+                    search_query, 
+                    top_k=4, 
+                    active_doc_ids=st.session_state.get("active_doc_ids")
+                )
             for r in results:
                 st.markdown(f"""
                 <div class="source-box">

@@ -37,6 +37,10 @@ MARK_SCHEMES = {
             {"component": "Crisp Definition / Statement / Principle", "marks": 1.0},
             {"component": "Key Feature, Formula, or Standard Example", "marks": 1.0}
         ],
+        "components": [
+            {"component": "Crisp Definition / Statement / Principle", "marks": 1.0},
+            {"component": "Key Feature, Formula, or Standard Example", "marks": 1.0}
+        ],
         "diagram_required": False,
         "description": "Precise, conceptual definition or core equation without unnecessary filler."
     },
@@ -48,6 +52,11 @@ MARK_SCHEMES = {
             {"component": "Core Explanation / Working Principle (3-4 points)", "marks": 2.5},
             {"component": "Schematic / Syntax / Formula / Example", "marks": 1.5}
         ],
+        "components": [
+            {"component": "Introduction & Definition", "marks": 1.0},
+            {"component": "Core Explanation / Working Principle (3-4 points)", "marks": 2.5},
+            {"component": "Schematic / Syntax / Formula / Example", "marks": 1.5}
+        ],
         "diagram_required": "Optional / Recommended if architectural or schematic",
         "description": "Structured explanation covering fundamentals, working, and a relevant example or simple block diagram."
     },
@@ -55,6 +64,12 @@ MARK_SCHEMES = {
         "label": "10 Marks (Long Answer)",
         "expected_length": "350 - 550 words (comprehensive technical essay)",
         "breakdown": [
+            {"component": "Introduction & Conceptual Background", "marks": 1.5},
+            {"component": "Neat Labeled Diagram / Architecture / Flowchart", "marks": 3.0},
+            {"component": "Detailed Working / Algorithm / Derivation / Mechanism", "marks": 3.5},
+            {"component": "Real-world Example, Pros/Cons or Complexity Analysis", "marks": 2.0}
+        ],
+        "components": [
             {"component": "Introduction & Conceptual Background", "marks": 1.5},
             {"component": "Neat Labeled Diagram / Architecture / Flowchart", "marks": 3.0},
             {"component": "Detailed Working / Algorithm / Derivation / Mechanism", "marks": 3.5},
@@ -73,10 +88,56 @@ MARK_SCHEMES = {
             {"component": "Mathematical Formulation / Algorithm & Code / Case Study", "marks": 2.5},
             {"component": "Comparison Table, Advantages, Limitations & Summary", "marks": 1.5}
         ],
+        "components": [
+            {"component": "Introduction & Theoretical Foundation", "marks": 2.0},
+            {"component": "Comprehensive Architecture & Labeled Diagram", "marks": 4.0},
+            {"component": "In-depth Component Analysis & Operation Workflow", "marks": 5.0},
+            {"component": "Mathematical Formulation / Algorithm & Code / Case Study", "marks": 2.5},
+            {"component": "Comparison Table, Advantages, Limitations & Summary", "marks": 1.5}
+        ],
         "diagram_required": True,
         "description": "Exhaustive multi-part answer for full-module coverage, rigorous diagrams, algorithms, and comparative analysis."
     }
 }
+
+def calibrate_scheme_components(components_list: list, target_marks: float) -> list:
+    """
+    Calibrates component allocated marks proportionally so they strictly divide
+    and sum up to target_marks exactly.
+    """
+    if not components_list:
+        return []
+
+    target_marks = float(target_marks)
+    current_marks = []
+    for c in components_list:
+        try:
+            m = float(c.get("marks", 1.0))
+        except (ValueError, TypeError):
+            m = 1.0
+        current_marks.append(max(0.1, m))
+
+    total_current = sum(current_marks)
+    if total_current <= 0:
+        total_current = float(len(components_list))
+        current_marks = [1.0] * len(components_list)
+
+    # Scale proportionally
+    scaled_marks = [round((m / total_current) * target_marks, 1) for m in current_marks]
+
+    # Adjust rounding remainder on the largest element
+    diff = round(target_marks - sum(scaled_marks), 1)
+    if diff != 0:
+        max_idx = scaled_marks.index(max(scaled_marks))
+        scaled_marks[max_idx] = round(scaled_marks[max_idx] + diff, 1)
+
+    calibrated = []
+    for c, sm in zip(components_list, scaled_marks):
+        comp_copy = dict(c)
+        comp_copy["marks"] = sm
+        calibrated.append(comp_copy)
+
+    return calibrated
 
 # Supported LLM Models
 GEMINI_MODELS = [
